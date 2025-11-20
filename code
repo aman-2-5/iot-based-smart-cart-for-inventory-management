@@ -1,0 +1,521 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+#include <SoftwareSerial.h>
+
+// ----- LCD (change 0x27 to 0x3F if your module uses that) -----
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ----- SIM900 on SoftwareSerial (ESP RX = D6, ESP TX = D5) ----
+#define SIM_BAUD 9600
+SoftwareSerial SIM900(D6, D5);
+
+// ----- WiFi ---------------------------------------------------
+const char* ssid     = "SMART CART";
+const char* password = "smart@cart123";
+
+// ----- Web Server ---------------------------------------------
+ESP8266WebServer server(80);
+
+// ----- Scan buffer --------------------------------------------
+char input[12];
+int count = 0;
+
+// ----- Products & cart ----------------------------------------
+const char* PRODUCT_NAMES[4]   = {"Biscuits", "Soap", "Rice (1KG)", "Tea (50g)"};
+const double PRODUCT_PRICES[4] = {35.0,      38.0,   55.0,         45.0};
+int p1 = 0, p2 = 0, p3 = 0, p4 = 0;
+int stock[4] = {5, 5, 5, 5};
+double total = 0.0;
+
+// ----- Wishlist (in-RAM) --------------------------------------
+#define MAX_WISHLIST_PER_ITEM 15
+String wishlistNumbers[4][MAX_WISHLIST_PER_ITEM];
+int wishlistCount[4] = {0,0,0,0};
+
+// ----- Numbers (UPDATED) --------------------------------------
+const String shopkeeperNumber = "+918058203698";   // supplier/shopkeeper
+const String customerNumber   = "+919024303698";   // checkout + wishlist notifications
+
+// ----- Forward decls ------------------------------------------
+void setupWebServer();
+void processItem(String item, double price, int index, int *productCounter);
+void sendOutOfStockSMS(String item);
+void sendTotalSMSAndReset();
+void updateCosts();
+bool addToWishlist(int itemIndex, const String& number);
+void notifySupplierWishlist(int itemIndex);
+void notifyWishlistersRestocked(int itemIndex);
+void restockItem(int itemIndex, int qty);
+
+// Robust SMS helpers
+bool waitFor(Stream &s, const char* target, uint32_t timeoutMs=8000);
+void flushInput(Stream &s);
+bool sendSMS_Robust(String number, String message);
+void sendSMS_Legacy(String number, String message);
+void sendSMS(String number, String message);     // unified wrapper
+void initSIM();                                   // put SIM900 in known-good state
+
+// URL decode (kept for completeness)
+String urlDecode(const String& str) {
+  String decoded = "";
+  char temp[] = "00";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (c == '+') decoded += ' ';
+    else if (c == '%') {
+      if (i + 2 < str.length()) {
+        temp[0] = str.charAt(i + 1);
+        temp[1] = str.charAt(i + 2);
+        char decodedChar = (char) strtol(temp, NULL, 16);
+        decoded += decodedChar;
+        i += 2;
+      }
+    } else decoded += c;
+  }
+  return decoded;
+}
+
+void setup() {
+  pinMode(D3, INPUT_PULLUP);
+  pinMode(D4, OUTPUT);
+
+  Serial.begin(9600);
+  SIM900.begin(SIM_BAUD);
+  WiFi.begin(ssid, password);
+
+  // I2C for LCD on ESP8266 (SDA=D2, SCL=D1)
+  Wire.begin(D2, D1);
+
+  // LCD init
+  lcd.begin(16, 2);
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print(F("   WELCOME TO   "));
+  lcd.setCursor(0, 1);
+  lcd.print(F("    SMART CART  "));
+  delay(1500);
+  lcd.clear();
+
+  // Init SIM900 to a known state (very important)
+  initSIM();
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    lcd.setCursor(0, 0);
+    lcd.print(F("WiFi Connecting "));
+    lcd.setCursor(0, 1);
+    lcd.print(F(" please wait... "));
+  }
+
+  Serial.println(WiFi.localIP());
+  lcd.setCursor(0, 0);
+  lcd.print(F("WiFi Connected  "));
+  lcd.setCursor(0, 1);
+  String ip = WiFi.localIP().toString();
+  if (ip.length() < 16) ip += String(' ', 16 - ip.length());
+  lcd.print(ip.substring(0,16));
+  delay(1000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F(" PLZ ADD ITEMS  "));
+  lcd.setCursor(0, 1);
+  lcd.print(F("     TO CART    "));
+
+  setupWebServer();
+  server.begin();
+}
+
+void setupWebServer() {
+  // Home UI (clean Action column) + Auto-Refresh toggle
+  server.on("/", []() {
+    bool autoRefresh = server.hasArg("autoRefresh") ? (server.arg("autoRefresh") == "on") : false;
+    String autoRefreshMetaTag = autoRefresh ? "<meta http-equiv='refresh' content='3'>" : "";
+    String autoRefreshCheckbox = autoRefresh ? "checked" : "";
+
+    String webpage;
+    webpage.reserve(3500);
+    webpage  = F("<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Smart Cart</title>");
+    webpage += autoRefreshMetaTag;
+    webpage += F("<style>body{font-family:Arial}table{width:95%;margin:10px auto;border-collapse:collapse}"
+                 "th,td{border:1px solid #ccc;padding:6px;text-align:left}"
+                 "th{background:#4CAF50;color:#fff}.pill{padding:2px 6px;border-radius:10px;background:#eee}"
+                 "button,select{padding:6px;margin:2px}label{margin-left:8px}</style>");
+    webpage += F("<script>function setAutoRefresh(cb){const on=cb.checked?'on':'off';const u=new URL(window.location);"
+                 "u.searchParams.set('autoRefresh',on);window.location=u.toString();}</script>");
+    webpage += F("</head><body>");
+    webpage += F("<h2 style='text-align:center'>Smart Shopping Cart</h2>");
+
+    int quantities[4] = {p1, p2, p3, p4};
+    double lineTotals[4] = {
+      quantities[0] * PRODUCT_PRICES[0],
+      quantities[1] * PRODUCT_PRICES[1],
+      quantities[2] * PRODUCT_PRICES[2],
+      quantities[3] * PRODUCT_PRICES[3]
+    };
+
+    webpage += F("<table><tr><th>Item</th><th>Qty</th><th>Price</th><th>Stock</th><th>Wishlist</th><th>Action</th></tr>");
+    for (int i = 0; i < 4; i++) {
+      webpage += F("<tr><td>");
+      webpage += PRODUCT_NAMES[i];
+      webpage += F("</td><td>");
+      webpage += String(quantities[i]);
+      webpage += F("</td><td>₹");
+      webpage += String(lineTotals[i], 2);
+      webpage += F("</td><td>");
+      webpage += String(stock[i]);
+      if (stock[i] == 0) webpage += F(" <span class='pill'>OOS</span>");
+      webpage += F("</td><td>");
+      webpage += String(wishlistCount[i]);
+      webpage += F("</td><td>");
+      if (stock[i] == 0) {
+        // Single Wishlist button — uses fixed customerNumber
+        webpage += F("<form action='/wishlist/add' method='GET' style='display:inline'>");
+        webpage += F("<input type='hidden' name='item' value='");
+        webpage += String(i);
+        webpage += F("'><button type='submit'>Wishlist</button></form>");
+      } else {
+        webpage += F("<span>In stock</span>");
+      }
+      webpage += F("</td></tr>");
+    }
+    webpage += F("<tr><td colspan='2'><b>Total</b></td><td><b>₹");
+    webpage += String(total, 2);
+    webpage += F("</b></td><td colspan='3'></td></tr></table>");
+
+    // Restock mini-form
+    webpage += F("<div style='width:95%;margin:10px auto'><h3>Admin: Restock</h3>"
+                 "<form action='/restock' method='GET'>"
+                 "<label>Item <select name='item'>");
+    for (int i = 0; i < 4; i++) {
+      webpage += F("<option value='");
+      webpage += String(i);
+      webpage += F("'>");
+      webpage += PRODUCT_NAMES[i];
+      webpage += F("</option>");
+    }
+    webpage += F("</select></label> "
+                 "<label>Qty <input type='text' name='qty' required></label> "
+                 "<button type='submit'>Apply</button></form>"
+                 "<small>Restock notifies all wishlisters if stock &gt; 0.</small></div>");
+
+    // Payment/Admin links + Auto-Refresh toggle control
+    webpage += F("<div style='text-align:center;margin:12px'>"
+                 "<button onclick=\"location.href='https://smart-cart-payment.netlify.app/'\">Proceed Payment of ₹");
+    webpage += String(total, 2);
+    webpage += F("</button> "
+                 "<button onclick=\"location.href='https://smart-cart-admin-login.netlify.app/'\">Admin Login</button>"
+                 "<label class='button' style='margin-left:12px'>Auto Refresh: "
+                 "<input type='checkbox' ");
+    webpage += autoRefreshCheckbox;
+    webpage += F(" onclick='setAutoRefresh(this)'></label>"
+                 "</div>");
+
+    webpage += F("</body></html>");
+    server.send(200, F("text/html"), webpage);
+  });
+
+  // Add to wishlist (fixed number)
+  server.on("/wishlist/add", []() {
+    if (!server.hasArg("item")) {
+      server.send(400, F("text/plain"), F("Missing 'item'"));
+      return;
+    }
+    int item = server.arg("item").toInt();
+    if (item < 0 || item > 3) {
+      server.send(400, F("text/plain"), F("Invalid item index"));
+      return;
+    }
+    if (stock[item] > 0) {
+      server.send(200, F("text/plain"), F("Item in stock. Purchase directly."));
+      return;
+    }
+
+    bool added = addToWishlist(item, customerNumber);
+    if (!added) {
+      server.send(200, F("text/plain"), F("Already on wishlist or wishlist full."));
+      return;
+    }
+    notifySupplierWishlist(item); // demand signal to shopkeeper
+    server.send(200, F("text/plain"), F("Added to wishlist. You'll get SMS when restocked."));
+  });
+
+  // Restock (notify if any wishlisters exist and stock becomes > 0)
+  server.on("/restock", []() {
+    if (!server.hasArg("item") || !server.hasArg("qty")) {
+      server.send(400, F("text/plain"), F("Missing 'item' or 'qty'"));
+      return;
+    }
+    int item = server.arg("item").toInt();
+    int qty  = server.arg("qty").toInt();
+    if (item < 0 || item > 3 || qty <= 0) {
+      server.send(400, F("text/plain"), F("Invalid item or qty"));
+      return;
+    }
+    restockItem(item, qty);
+    server.send(200, F("text/plain"), F("Restocked and (if any) wishlisters notified."));
+  });
+
+  // Debug: list wishlist (helps verify numbers are queued)
+  server.on("/wishlist/list", []() {
+    String out;
+    out.reserve(1024);
+    out += F("Wishlist status:\n");
+    for (int i = 0; i < 4; i++) {
+      out += String(i) + ": " + PRODUCT_NAMES[i] + " -> " + String(wishlistCount[i]) + " numbers\n";
+      for (int j = 0; j < wishlistCount[i]; j++) {
+        if (wishlistNumbers[i][j].length() > 0) out += "  - " + wishlistNumbers[i][j] + "\n";
+      }
+    }
+    server.send(200, F("text/plain"), out);
+  });
+
+  // Debug: manual notify (optional)
+  server.on("/notify", []() {
+    if (!server.hasArg("item")) { server.send(400, F("text/plain"), F("Missing 'item'")); return; }
+    int item = server.arg("item").toInt();
+    if (item < 0 || item > 3) { server.send(400, F("text/plain"), F("Invalid item index")); return; }
+    if (wishlistCount[item] == 0) { server.send(200, F("text/plain"), F("No wishlisters to notify.")); return; }
+    notifyWishlistersRestocked(item);
+    server.send(200, F("text/plain"), "Notified and cleared wishlist for item " + String(item));
+  });
+}
+
+void loop() {
+  int a = digitalRead(D3);
+  if (Serial.available()) {
+    count = 0;
+    while (Serial.available() && count < 12) {
+      input[count] = Serial.read();
+      count++;
+      delay(5);
+    }
+    if (count == 12) {
+      if ((strncmp(input, "1F00500B4501", 12) == 0) && (a == 1)) {
+        processItem("Biscuit",   PRODUCT_PRICES[0], 0, &p1);
+      } else if ((strncmp(input, "1F004D159ED9", 12) == 0) && (a == 1)) {
+        processItem("Soap",      PRODUCT_PRICES[1], 1, &p2);
+      } else if ((strncmp(input, "1F004D5F2C21", 12) == 0) && (a == 1)) {
+        processItem("Rice(1KG)", PRODUCT_PRICES[2], 2, &p3);
+      } else if ((strncmp(input, "1F004D542F29", 12) == 0) && (a == 1)) {
+        processItem("Tea(50g)",  PRODUCT_PRICES[3], 3, &p4);
+      } else if (strncmp(input, "54006DD99575", 12) == 0) {
+        sendTotalSMSAndReset();
+      }
+    }
+    updateCosts();
+  }
+  server.handleClient();
+}
+
+// ================= Wishlist =================
+bool addToWishlist(int itemIndex, const String& number) {
+  if (number.length() < 8) return false;
+  for (int i = 0; i < wishlistCount[itemIndex]; i++) {
+    if (wishlistNumbers[itemIndex][i] == number) return false;
+  }
+  if (wishlistCount[itemIndex] >= MAX_WISHLIST_PER_ITEM) return false;
+  wishlistNumbers[itemIndex][wishlistCount[itemIndex]] = number;
+  wishlistCount[itemIndex]++;
+  Serial.println("[WISHLIST] item=" + String(itemIndex) + " added=" + number +
+                 " total=" + String(wishlistCount[itemIndex]));
+  return true;
+}
+
+void notifySupplierWishlist(int itemIndex) {
+  String msg = "Wishlist request: ";
+  msg += PRODUCT_NAMES[itemIndex];
+  msg += ". Total waiting: ";
+  msg += String(wishlistCount[itemIndex]);
+  sendSMS(shopkeeperNumber, msg);
+}
+
+void notifyWishlistersRestocked(int itemIndex) {
+  Serial.println("[NOTIFY] item=" + String(itemIndex) + " wishlisters=" + String(wishlistCount[itemIndex]));
+  for (int i = 0; i < wishlistCount[itemIndex]; i++) {
+    String num = wishlistNumbers[itemIndex][i];
+    if (num.length() > 0) {
+      String m = String(PRODUCT_NAMES[itemIndex]) + " is back in stock! Hurry to buy!";
+      sendSMS(num, m);
+    }
+    wishlistNumbers[itemIndex][i] = "";
+  }
+  wishlistCount[itemIndex] = 0;
+}
+
+void restockItem(int itemIndex, int qty) {
+  int before = stock[itemIndex];
+  stock[itemIndex] += qty;
+
+  Serial.println("[RESTOCK] item=" + String(itemIndex) + " before=" + String(before) +
+                 " added=" + String(qty) + " now=" + String(stock[itemIndex]) +
+                 " waiters=" + String(wishlistCount[itemIndex]));
+
+  // Notify whenever there are waiters and stock is available
+  if (stock[itemIndex] > 0 && wishlistCount[itemIndex] > 0) {
+    notifyWishlistersRestocked(itemIndex);
+  }
+}
+
+// ================= Core cart =================
+void processItem(String item, double price, int index, int *productCounter) {
+  if (stock[index] > 0) {
+    lcd.setCursor(0, 0);
+    String line0 = item + " Added";
+    if (line0.length() < 16) line0 += String(' ', 16 - line0.length());
+    lcd.print(line0.substring(0,16));
+    lcd.setCursor(0, 1);
+    lcd.print("Price: Rs " + String(price));
+    digitalWrite(D4, HIGH);
+    delay(2000);
+    (*productCounter)++;
+    total += price;
+    stock[index]--;
+    digitalWrite(D4, LOW);
+    lcd.clear();
+    if (stock[index] == 0) sendOutOfStockSMS(item);
+  } else {
+    sendOutOfStockSMS(item);
+  }
+}
+
+void sendOutOfStockSMS(String item) {
+  sendSMS(shopkeeperNumber, item + " is out of stock!");
+  lcd.setCursor(0, 0);
+  String shortName = item;
+  if (shortName.length() > 12) shortName = shortName.substring(0,12);
+  String line0 = "   " + shortName + "   ";
+  if (line0.length() < 16) line0 += String(' ', 16 - line0.length());
+  lcd.print(line0.substring(0,16));
+  lcd.setCursor(0, 1);
+  lcd.print(F(" Out of Stock  "));
+  delay(2000);
+  lcd.clear();
+}
+
+void sendTotalSMSAndReset() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Total Items: " + String(p1 + p2 + p3 + p4));
+  delay(3000);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("   Thank you   "));
+  lcd.setCursor(0, 1);
+  lcd.print(F(" for Shopping! "));
+  sendSMS(customerNumber, "Total bill: Rs" + String(total, 2));
+  digitalWrite(D4, LOW);
+  delay(1500);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F(" PLZ ADD ITEMS "));
+  lcd.setCursor(0, 1);
+  lcd.print(F("     TO CART   "));
+  total = 0;
+  // Keep your original behavior: reset stock after checkout
+  stock[0] = stock[1] = stock[2] = stock[3] = 5;
+  p1 = p2 = p3 = p4 = 0;
+}
+
+void updateCosts() {
+  // placeholder
+}
+
+// ================= SIM/SMS =================
+void initSIM() {
+  // A few tries with gentle delays; ignore responses here
+  for (int i = 0; i < 3; i++) {
+    SIM900.print(F("AT\r"));
+    delay(400);
+  }
+  SIM900.print(F("ATE0\r"));          // echo off
+  delay(300);
+  SIM900.print(F("AT+CMGF=1\r"));     // text mode
+  delay(300);
+  SIM900.print(F("AT+CSCS=\"GSM\"\r"));// charset
+  delay(300);
+  // Optional: ensure SMS indications do not flood serial
+  SIM900.print(F("AT+CNMI=1,0,0,0,0\r"));
+  delay(300);
+}
+
+bool waitFor(Stream &s, const char* target, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  size_t idx = 0, len = strlen(target);
+  while (millis() - start < timeoutMs) {
+    if (s.available()) {
+      char c = s.read();
+      Serial.write(c); // echo module output to USB Serial for debugging
+      if (c == target[idx]) {
+        if (++idx >= len) return true;
+      } else {
+        idx = (c == target[0]) ? 1 : 0;
+      }
+    }
+    yield();
+  }
+  return false;
+}
+
+void flushInput(Stream &s) {
+  while (s.available()) s.read();
+}
+
+// Robust path (waits for '>' and final 'OK')
+bool sendSMS_Robust(String number, String message) {
+  flushInput(SIM900);
+
+  SIM900.print(F("AT\r"));
+  if (!waitFor(SIM900, "OK", 2500)) { Serial.println(F("\n[ERR] No AT OK")); return false; }
+
+  SIM900.print(F("AT+CMGF=1\r"));
+  if (!waitFor(SIM900, "OK", 2500)) { Serial.println(F("\n[ERR] CMGF")); return false; }
+
+  SIM900.print(F("AT+CSCS=\"GSM\"\r"));
+  waitFor(SIM900, "OK", 2500);
+
+  SIM900.print(F("AT+CMGS=\""));
+  SIM900.print(number);
+  SIM900.print(F("\"\r"));
+
+  if (!waitFor(SIM900, ">", 8000)) { Serial.println(F("\n[ERR] No '>' prompt")); return false; }
+
+  // Some modules like an extra CR before Ctrl+Z
+  SIM900.print(message);
+  SIM900.print("\r");
+  SIM900.write(26);  // Ctrl+Z
+
+  if (!waitFor(SIM900, "OK", 20000)) {
+    Serial.println(F("\n[ERR] No final OK (network or SIM error)"));
+    return false;
+  }
+  Serial.println(F("\n[OK] SMS sent (robust)"));
+  return true;
+}
+
+// Legacy path (simple delays; works on very finicky modules)
+void sendSMS_Legacy(String number, String message) {
+  SIM900.print(F("AT+CMGF=1\r"));
+  delay(1000);
+  SIM900.print(F("AT+CSCS=\"GSM\"\r"));
+  delay(800);
+  SIM900.print(F("AT+CMGS=\""));
+  SIM900.print(number);
+  SIM900.println(F("\""));
+  delay(1500);
+  SIM900.println(message);
+  delay(400);
+  SIM900.write(26); // Ctrl+Z
+  delay(5000);
+  Serial.println(F("[OK] SMS attempted (legacy path)"));
+}
+
+// Unified wrapper: try robust, fallback to legacy
+void sendSMS(String number, String message) {
+  if (!sendSMS_Robust(number, message)) {
+    sendSMS_Legacy(number, message);
+  }
+}
